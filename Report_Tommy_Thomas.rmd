@@ -1,0 +1,543 @@
+---
+title: "Regression - Final Project: House Prices Prediction"
+author: "Tommy Tran - Thomas de Mareuil"
+date: "12/22/2019"
+output:
+  pdf_document: default
+  html_document: default
+  df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE)
+```
+
+# I. Introduction
+
+The goal of this project is to build a model to predict house prices based on several input variables, both quantitative and qualitative. For training, we use a pre-processed dataset containing 1460 àbservations of 68 variables, among which information about sale prices, location, house characteristics.
+
+Our research hypothesis is that sale prices can be estimated with a certain accuracy based on such a set of variables. We will first go through exploratory data analysis to understand our dataset and check how variables behave (compared to sale price and to each other), before building and evaluating regression models.
+
+Considering the large number of covariates in our dataset, an important step will be to select the most relevant ones. For numerical variables, we will analyse correlation in the EDA part. For categorical variables, we will evaluate significance with Anova/Ancova in the Modeling part. We will then try several models, select features, check postulates, and keep the best-performing model.
+
+```{r import packages, include=FALSE}
+library(tidyverse)
+library(GGally)
+library(corrplot)
+library(xgboost)
+library(ggplot2)
+library(caret)
+library(MASS)
+library(carData)
+library(car)
+library(readr)
+URL="http://www.statoo.com/DATA/MS/"
+source(paste(URL, "VIF.R", sep=""))
+```
+
+___Load the data___
+```{r}
+data = read.csv('train_preprocessed.csv', header=TRUE, row.names="X")
+```
+
+
+# II. Exploratory Data Analysis
+
+In our preprocessed dataset, we have a total of 66 covariates, of which 28 are quantitative and 38 are qualitative:
+```{r}
+quantitative = names(dplyr::select_if(data, is.numeric))
+qualitative = names(dplyr::select_if(data, is.object))
+```
+
+## Sale Price distribution
+
+```{r, fig.height = 3, fig.width = 5, fig.align = "center"}
+hist(x = data$SalePrice, breaks = 100)
+```
+
+The `SalePrice` distribution is skewed (i.e. most house are sold at intermediate prices but a significant number of houses are very expensive). We'll scale prices by applying a log transformation before performing regression.
+
+```{r, fig.height = 3.5, fig.width = 8, fig.align = "center"}
+data$SalePrice <- log(data$SalePrice)
+par(mfrow = c(1,2))
+hist(x = data$SalePrice, breaks = 50, xlab = "LogSalePrice", main = "Histogram of LogSalePrice")
+boxplot(data$SalePrice, ylab = "LogSalePrice", main = "Distribution of LogSalePrice")
+```
+
+## Correlation analysis of numerical variables
+
+To plot linear correlation relationships between variables, we could use pair plots or correlation plots. Considering the large number of variables, let's plot the more visual `corrplot`:
+
+```{r, fig.height = 3.5, fig.width = 6, fig.align = "center"}
+M <- cor(data[quantitative], method = c("pearson", "kendall", "spearman"))
+corrplot(M, method='ellipse', tl.cex=0.6)
+```
+
+The variables less correlated to SalePrice appear to be: `MSSubClass`, `OverallCond`, `BsmtFinSF1`, `BsmtUnfSF`, `X2ndFlrSF`, `BsmtFullBath`, `BsmtHalfBath`, `HalfBath`, `BedroomAbvGr`, `MoSold`, `YrSold`. `MSSubClass` is a number corresponding to the house type, with higher numbers not representing better quality (no order), therefore we should better cast this variable as categorical. For the other ones, we will try a model with and without them to check if removing variables less correlated to SalePrice improves predictions. 
+
+```{r}
+data$MSSubClass <- as.factor(data$MSSubClass)
+quantitative = names(dplyr::select_if(data, is.numeric))
+qualitative = names(dplyr::select_if(data, is.object))
+```
+
+We also observe multicolinearity between our numerical covariates. Let's take a deeper look by computing VIF (Variance Inflation Factors), which measures how much the variance of a regression coefficient is inflated due to multicollinearity in the model. The smallest possible value of VIF is one (absence of multicollinearity). As a rule of thumb, a VIF value that exceeds 5 or 10 indicates a problematic amount of collinearity (James et al. 2014). Multicollinearity implies that the information that this variable provides about the response is redundant in the presence of the other variables.
+
+```{r}
+VIF(data[quantitative] %>% dplyr::select(-SalePrice), data$SalePrice)
+```
+
+Here, the mean VIF is below 5, therefore there doesn't seem to be a significant problem with multicolinearity. However 3 variables (`X1stFlrSF`, `X2ndFlrSF` and `GrLiveArea`) have VIF above 10. We will try a model without these varibales to check if it performs better (- knowing that `GrLiveArea` corresponds to living area surface: it sounds very relevant to explain sale prices! We'll see in the modeling part).
+
+## Categorical variables
+
+For categorical variables, we could plot boxplots to visualize the distribution of saleprice based on different modalities. We could also print `SalePrice` means per modality. See example with `MSZoning` below, showing that `SalePrice` is impacted by the zoning classification of the sale (different means per category). As we have a lot of categorical variables, we will not conduct it for all variables, but we will select the most relevant ones using anova and step by step selection in the next section.
+
+```{r, fig.height = 3.5, fig.width = 8, fig.align = "center"}
+ggplot(data, aes(x = data$MSZoning, y = data$SalePrice, colour=data$MSZoning, fill=data$MSZoning)) +
+  geom_boxplot(alpha=0.5, outlier.alpha=0) + geom_jitter(width=0.25) +
+  stat_summary(fun.y=mean, colour="black", geom="point")
+```
+
+```{r}
+Tmean=tapply(data$SalePrice,list(MSZoning=data$MSZoning),mean);Tmean
+```
+
+Let's now move on to building and evaluating different regression models.
+
+
+# III. Modeling and Diagnostics
+
+## Linear regression models
+
+### Train/Test Split
+
+First, we split the data into train and test sets.
+
+```{r}
+set.seed(2019)
+inTrain <- createDataPartition(y = data$SalePrice, p = 0.85, list = FALSE) 
+train <- data[inTrain, ]
+test <- data[-inTrain, ]
+```
+
+
+### Full Model
+
+As a first try, let's put all variables into a simple linear regression model.
+
+```{r, warning=FALSE, results = 'hide'}
+reg1 <-lm(SalePrice  ~., data=data)
+summary(reg1)
+```
+___Output:___\
+Residual standard error: 0.1018 on 1224 degrees of freedom\
+Multiple R-squared:  0.9455,	Adjusted R-squared:  0.9351\
+F-statistic: 90.45 on 235 and 1224 DF,  p-value: < 2.2e-16\
+
+___Model evaluation:___\
+```{r, warning=FALSE}
+predicted = predict(reg1, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(reg1, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+radjust2=1-(1-rsq)*(1044/(1045-259-1))
+
+message("train RMSE: ", RMSE_train)
+message("test RMSE: ", RMSE)
+message("test adjusted R square: ", radjust)
+```
+
+This first model is already performant, but many variables aren't considered as significant based on t-test in the model summary output. Potential overfitting occurs when including all variables. Let's select the most relevant variables.
+
+
+### Model based on EDA correlation analysis
+
+When removing the variables spotted in EDA as multicolinear or less related to SalePrice, we obtained the following results.
+
+```{r, warning=FALSE, results = 'hide'}
+reg2 <-lm(SalePrice  ~ . - OverallCond - BsmtFinSF1 - BsmtUnfSF - X2ndFlrSF -
+            BsmtFullBath - BsmtHalfBath - HalfBath - BedroomAbvGr - MoSold -
+            YrSold - X2ndFlrSF, data=data)
+summary(reg2)
+```
+
+```{r, warning=FALSE, include=F, results = 'hide'}
+predicted = predict(reg2, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(reg2, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+radjust2=1-(1-rsq)*(1044/(1045-259-1))
+
+message("train RMSE: ",RMSE_train)
+message("test RMSE: ",RMSE)
+message("test adjusted R square: ", radjust)
+```
+___Output:___\
+train RMSE: 0.0972971292224848\
+test RMSE: 0.103917924636335\
+test adjusted R square: 0.90585505133741\
+
+This model yields a slightly higher mean square error on the test set and a slighlty lower adjusted R square than the full model. Therefore we decided not to discard the covariates we had spotted and to try other feature selection methods.
+
+### Feature selection with AIC
+
+We performed AIC (using the forward, backward and both method) to select the most significant features. We chose to use AIC and not BIC because of the high number of covariates. The 3 methods yielded very similar results, the backward method being slightly more performant. It selected 40 covariates:
+
+```{r, results = 'hide'}
+#stepAIC(reg1, ~., trace=TRUE, direction=c("backward"))
+```
+
+```{r}
+reg3 <- lm(formula = SalePrice ~ MSSubClass + MSZoning + LotArea + LotConfig + 
+    LandSlope + Neighborhood + Condition1 + Condition2 + OverallQual + 
+    OverallCond + YearBuilt + YearRemodAdd + RoofMatl + Exterior1st + 
+    MasVnrType + Foundation + BsmtQual + BsmtExposure + BsmtFinSF1 + 
+    BsmtUnfSF + TotalBsmtSF + Heating + HeatingQC + CentralAir + 
+    GrLivArea + BsmtFullBath + FullBath + HalfBath + KitchenQual + 
+    Functional + Fireplaces + GarageType + GarageYrBlt + GarageCars + 
+    GarageArea + GarageQual + GarageCond + WoodDeckSF + SaleType + 
+    SaleCondition, data = data)
+```
+
+```{r, include=F, warning=FALSE}
+predicted = predict(reg3, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(reg3, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+radjust2=1-(1-rsq)*(1044/(1045-259-1))
+
+message("train RMSE: ",RMSE_train)
+message("test RMSE: ",RMSE)
+message("test adjusted R square: ", radjust)
+```
+___Output:___\
+train RMSE: 0.0955541308687478\
+test RMSE: 0.0976432548916017\
+test adjusted R square: 0.916880946456593\
+
+This new model is equivalent to the full model in terms of mean square error and adjusted R2, but we chose to keep it as it includes less covariates, which are all significant.
+
+
+### Model including impact of interaction between regressors
+
+We finally used ANCOVA (as we have a mix of numerical and categorical variables) to assess the impact of interaction between regressors on the predictions. We tested the most relevant combinations based on our understanding of the different variables. When we spotted interactions impacting significantly our predictions, we dropped the corresponding single variables and kept the interaction in order to obtain a more efficient model. The best model we could obtain this way was finally:
+
+```{r, warning=FALSE, results = 'hide'}
+reg4 <- lm(SalePrice ~ MSSubClass * MSZoning + LotArea * Neighborhood +
+    LotConfig + LandSlope + Condition1 + Condition2 + OverallQual * GrLivArea + 
+    OverallCond * YearBuilt + RoofMatl * Exterior1st + 
+    Foundation + BsmtQual * BsmtExposure + YearRemodAdd + MasVnrType + BsmtFinSF1 +
+    TotalBsmtSF + BsmtUnfSF + Heating + HeatingQC + CentralAir + 
+    BsmtFullBath + HalfBath + KitchenQual + MasVnrType +
+    Fireplaces + GarageYrBlt + GarageCars + Functional + 
+    GarageYrBlt:GarageCars:GarageArea:GarageQual:GarageCond + SaleType + 
+    SaleCondition, data = data)
+anova(reg4)
+```
+
+```{r, include = F, warning=FALSE}
+predicted = predict(reg4, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(reg4, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+radjust2=1-(1-rsq)*(1044/(1045-259-1))
+
+message("train RMSE: ",RMSE_train)
+message("test RMSE: ",RMSE)
+message("test adjusted R square: ", radjust)
+```
+___Output:___\
+train RMSE: 0.0879503124367945\
+test RMSE: 0.0908861822990065\
+test adjusted R square: 0.927986848769291\
+
+## Residuals Analysis
+
+```{r,message=FALSE,warning=FALSE, fig.height = 4, fig.width = 8, fig.align = "center"}
+layout(matrix(c(1,2,3,4,5), 2, 2, byrow = TRUE))
+plot(reg4)
+```
+
+```{r, fig.height = 2.5, fig.width = 7, fig.align = "center"}
+acf(residuals(reg4), main = "Autocorrelation plot")
+```
+
+* Errors are approximately centered around 0.\
+* The QQ-plot and the Shapiro-Wilk test below reveal that the Gaussianity assumption isn't totally met, but we already performed logtransformation of the output variable and this assumption isn't the most necessary one, so for now we'll stick with our model as it is.\
+* Homoscedasticity seems questionable, so we ran a Breush-Pagan test (see below). The p-value is above 0.05, so we do not reject the homescedasticity assumption.\
+* The autocorrelation plot tells us that the postulate of uncorrelated residuals is reasonable since none of the bars after the first bar exceeds the threshold, which is confirmed by the Durbin-Watson test below (p-value above 0.05).\
+
+```{r}
+ncvTest(reg4) # Breush-Pagan test for homscedasticity
+```
+
+```{r}
+shapiro.test(residuals((reg4))) # Shapiro-Wilk test for Gaussianity
+```
+
+```{r}
+durbinWatsonTest(reg4) # Durbin-Watson test for autocorrelation
+```
+
+The last diagnostic plot, Residuals vs. Leverage, revealed no point with a Cook distance above 1. However, diagnostice plots show a few potential outliers that we will study in the next section.
+
+
+## Search for outliers
+
+Let's check if the potential outliers should be removed from our model by looking at their Bonferroni p-values:
+
+```{r}
+outlierTest(reg4)
+```
+
+We found 8 outliers with Bonferroni p-values below 0.05. We tried to compare our model including these outliers and a model without the outliers. The model without outilers yielded significantly best results, so we will run final diagnostic plots and select it as our final model.
+
+
+# IV. Final model
+
+```{r}
+data_out_removed = data[-c(826,524,633,463,1325,969,1454,1433),]
+
+final_reg <- lm(SalePrice ~ MSSubClass * MSZoning + LotArea * Neighborhood +
+    LotConfig + LandSlope + Condition1 + Condition2 + OverallQual * GrLivArea + 
+    OverallCond * YearBuilt + RoofMatl * Exterior1st + 
+    Foundation + BsmtQual * BsmtExposure + YearRemodAdd + MasVnrType + BsmtFinSF1 +
+    TotalBsmtSF + BsmtUnfSF + Heating + HeatingQC + CentralAir + 
+    BsmtFullBath + HalfBath + KitchenQual + MasVnrType +
+    Fireplaces + GarageYrBlt + GarageCars + Functional + 
+    GarageYrBlt:GarageCars:GarageArea:GarageQual:GarageCond + SaleType + 
+    SaleCondition, data = data_out_removed)
+```
+
+```{r, warning=FALSE, include = F}
+set.seed(2020)
+inTrain <- createDataPartition(y = data_out_removed$SalePrice, p = 0.85, list = FALSE) 
+train <- data_out_removed[inTrain, ]
+test <- data_out_removed[-inTrain, ]
+
+predicted = predict(final_reg, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(final_reg, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+radjust2=1-(1-rsq)*(1044/(1045-259-1))
+
+message("train RMSE: ",RMSE_train)
+message("test RMSE: ",RMSE)
+message("test adjusted R square: ", radjust)
+```
+___Output (Final Model):___\
+Residual standard error: 0.08381 on 1229 degrees of freedom\
+Multiple R-squared:  0.962,	Adjusted R-squared:  0.9551\
+F-statistic: 140.1 on 222 and 1229 DF,  p-value: < 2.2e-16\
+
+train RMSE: 0.0765191020162539\
+test RMSE: 0.0804040574197461\
+test adjusted R square: 0.947069947387763\
+
+This final model yields better results in terms of adjusted R sqaure and mean square error than all other models.
+
+Based on new diagnostic plots and tests, postulates are still validated - except for the Gaussianity assumption that still isn't perfectly met, but as this model is the best-performing one we will consider it as our final model.
+
+
+## Confidence intervals
+
+As a last step in our analysis, let's compute confidence intervals for our sale price estimates:
+
+```{r}
+ICconf = predict(final_reg, interval = "confidence", level = 0.95)
+head(ICconf)
+```
+
+
+## Other Models we tried
+
+In this additional sub-section we shortly present some of the other models we tried in order to predict the Sale prices - none of them yielded better result than our linear models, so we did not keep them.
+
+### XGBoost
+
+Before performing `XGBoost`, we encoded the data with one-hot encoding, we split our dataset between a train and a test set, and we selected parameters through `GridSearchCV`.
+
+```{r, warning=FALSE, include = F}
+#One-hot encoding
+data_hot = data
+ohe_feats = qualitative
+for (f in ohe_feats){
+  dummy = acm.disjonctif(data_hot[f])
+  data_hot[f] = NULL
+  data_hot = cbind(data_hot, dummy)}
+```
+
+```{r, include = F}
+#Train-test split
+set.seed(1337)
+inTrain <- createDataPartition(y = data_hot$SalePrice, p = 0.85, list = FALSE)  # 85% of data in train
+training <- data_hot[inTrain, ]
+testing <- data_hot[-inTrain, ]
+
+X_train = xgb.DMatrix(as.matrix(training %>% dplyr::select(-SalePrice)), label = training$SalePrice)
+y_train = training$SalePrice
+X_test = xgb.DMatrix(as.matrix(testing %>% dplyr::select(-SalePrice)), label = testing$SalePrice)
+y_test = testing$SalePrice
+```
+
+___Model training___
+```{r, results='hide'}
+params <- list(booster = "gbtree",  objective = "reg:squarederror", eta=0.1, 
+               gamma=0, max_depth=3, min_child_weight=1, subsample=1, colsample_bytree=0.9)
+
+xgb_model <- xgb.train( params = params, data = X_train, nrounds = 2000, 
+                        nfold = 5, showsd = T, stratified = T, print.every.n = 10, 
+                        early.stop.round = 20, watchlist = list(val=X_test, train=X_train),
+                        maximize = F)
+```
+
+```{r, results='hide', include = F}
+X_test = xgb.DMatrix(as.matrix(testing %>% dplyr::select(-SalePrice)))
+y_test = testing$SalePrice
+predicted = predict(xgb_model, X_test)
+residuals = y_test - predicted
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(y_test)
+tss = sum((y_test - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+radjust2=1-(1-rsq)*(1044/(1045-259-1))
+
+message("RMSE: ", RMSE)
+message("adjusted R square: ", radjust)
+```
+___Output:___\
+RMSE: 0.108650317957415\
+adjusted R square: 0.897268082348635\
+
+
+### Lasso
+
+```{r}
+set.seed(1012)
+lasso=train(SalePrice~., train, method='glmnet', 
+            tuneGrid=expand.grid(alpha=1,lambda=seq(0.01,0.1,length=10)))
+```
+
+```{r, warning=FALSE, results='hide', include = F}
+predicted = predict(lasso, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(lasso, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+
+message('train RMSE:', RMSE_train)
+message("test RMSE: ", RMSE)
+message("test adjusted R square: ", radjust)
+```
+___Output:___\
+train RMSE: 0.129390145987898\
+test RMSE: 0.113431110315135\
+test adjusted R square: 0.887762307368666\
+
+
+### Ridge
+
+```{r}
+set.seed(1012)
+ridge=train(SalePrice~.,train, method='glmnet',
+            tuneGrid=expand.grid(alpha=0,lambda=seq(13,15,length=10)))
+```
+
+```{r, warning=FALSE, results='hide', include = F}
+predicted = predict(ridge, test %>% dplyr::select(-SalePrice))
+predicted_train = predict(ridge, train %>% dplyr::select(-SalePrice))
+
+residuals_train=train$SalePrice - predicted_train
+residuals =test$SalePrice - predicted
+
+RMSE_train = sqrt(mean(residuals_train^2))
+RMSE = sqrt(mean(residuals^2))
+
+y_test_mean = mean(test$SalePrice)
+tss = sum((test$SalePrice - y_test_mean)^2)
+rss = sum(residuals^2)
+rsq = 1 - (rss/tss)
+radjust=1-(1044*rss)/((1045-260)*tss)
+
+message("train RMSE: ", RMSE_train)
+message("test RMSE: ", RMSE)
+message("test adjusted R square: ", radjust)
+```
+___Output:___\
+train RMSE: 0.300306365242122\
+test RMSE: 0.298312154569017\
+test adjusted R square: 0.223723817913419\
+
+$\rightarrow$ All these models performed less well than our custom linear regression.
+
+
+# V. Discussion
+
+The main difficulty we found in this analysis was to deal with a large number of variables, and identify which ones we more relevant to predict sale prices. For future improvement, we could for example talk with an industry expert, who could provide valuable insights regarding how to select the most relevant variables. Such industry knowledge could greatly improve our understanding of the data and help us build a more performant model.
+
+Our final model doesn't significantly overfit, but to improve robustness we could also go through an additional cross-validation step.
+
+Last, residuals in our final model don't exactly follow a Gaussian distribution. This doesn't invalidate our model, but it implies that it might not be the best one to understand our data. Maybe we miss here some relationships between the predictors and the outcome (maybe non-linear relationships that we don't capture?), or maybe we did not include some other variables that could play an important role, or maybe didn't identify some bias in our data... Our model still performs relatively well at predicting real estate sale prices, so we will stick with it for now - but this project shows that dealing with a large amount of data always leaves room for improvement!
